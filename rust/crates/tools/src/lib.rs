@@ -639,7 +639,7 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let body = response.text().map_err(|error| error.to_string())?;
     let bytes = body.len();
     let normalized = normalize_fetched_content(&body, &content_type);
-    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized);
+    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
 
     Ok(WebFetchOutput {
         bytes,
@@ -750,12 +750,18 @@ fn normalize_fetched_content(body: &str, content_type: &str) -> String {
     }
 }
 
-fn summarize_web_fetch(url: &str, prompt: &str, content: &str) -> String {
+fn summarize_web_fetch(
+    url: &str,
+    prompt: &str,
+    content: &str,
+    raw_body: &str,
+    content_type: &str,
+) -> String {
     let lower_prompt = prompt.to_lowercase();
     let compact = collapse_whitespace(content);
 
     let detail = if lower_prompt.contains("title") {
-        extract_title(content)
+        extract_title(content, raw_body, content_type)
             .map(|title| format!("Title: {title}"))
             .unwrap_or_else(|| preview_text(&compact, 600))
     } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
@@ -768,7 +774,21 @@ fn summarize_web_fetch(url: &str, prompt: &str, content: &str) -> String {
     format!("Fetched {url}\n{detail}")
 }
 
-fn extract_title(content: &str) -> Option<String> {
+fn extract_title(content: &str, raw_body: &str, content_type: &str) -> Option<String> {
+    if content_type.contains("html") {
+        let lowered = raw_body.to_lowercase();
+        if let Some(start) = lowered.find("<title>") {
+            let after = start + "<title>".len();
+            if let Some(end_rel) = lowered[after..].find("</title>") {
+                let title =
+                    collapse_whitespace(&decode_html_entities(&raw_body[after..after + end_rel]));
+                if !title.is_empty() {
+                    return Some(title);
+                }
+            }
+        }
+    }
+
     for line in content.lines() {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
@@ -1798,6 +1818,18 @@ mod tests {
         assert!(summary.contains("Fetched"));
         assert!(summary.contains("Test Page"));
         assert!(summary.contains("Hello world from local server"));
+
+        let titled = execute_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/page", server.addr()),
+                "prompt": "What is the page title?"
+            }),
+        )
+        .expect("WebFetch title query should succeed");
+        let titled_output: serde_json::Value = serde_json::from_str(&titled).expect("valid json");
+        let titled_summary = titled_output["result"].as_str().expect("result string");
+        assert!(titled_summary.contains("Title: Ignored"));
     }
 
     #[test]

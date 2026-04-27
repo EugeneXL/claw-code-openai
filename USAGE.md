@@ -225,6 +225,7 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 | `sk-ant-*` API key | `ANTHROPIC_API_KEY` | `x-api-key: sk-ant-...` | [console.anthropic.com](https://console.anthropic.com) |
 | OAuth access token (opaque) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | an Anthropic-compatible proxy or OAuth flow that mints bearer tokens |
 | OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| Azure OpenAI key | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL=https://<resource>.openai.azure.com/openai/v1/` | `api-key: ...` | Azure OpenAI resource or Azure AI Foundry project |
 
 **Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.
 
@@ -253,6 +254,29 @@ export OPENAI_API_KEY="local-dev-token"
 cd rust
 ./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
 ```
+
+### Azure OpenAI
+
+`claw` now supports Azure OpenAI through the same OpenAI-compatible backend. Configure an Azure key plus an Azure OpenAI base URL, then use either the deployment name directly or an explicit `azure/` prefix.
+
+```bash
+export AZURE_OPENAI_BASE_URL="https://YOUR-RESOURCE.openai.azure.com/openai/v1/"
+export AZURE_OPENAI_API_KEY="your-azure-key"
+
+cd rust
+./target/debug/claw --model "gpt-4.1" prompt "reply with the word ready"
+# or explicitly lock routing to Azure:
+./target/debug/claw --model "azure/gpt-4.1" prompt "reply with the word ready"
+```
+
+If your Azure setup still uses a deployment-style endpoint with `api-version`, `claw` also accepts that as the base URL, for example:
+
+```bash
+export AZURE_OPENAI_BASE_URL="https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT?api-version=2024-10-21"
+export AZURE_OPENAI_API_KEY="your-azure-key"
+```
+
+For Azure, the `model` value should match the deployment you created in Azure. If you prefer shorter names, add them as custom aliases in `settings.json`.
 
 ### Ollama
 
@@ -302,11 +326,12 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 | **Anthropic** (direct) | Anthropic Messages API | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 | **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
 | **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
+| **Azure OpenAI** | OpenAI Chat Completions | `AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_BASE_URL` | none; set your Azure resource URL |
 | **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 
-The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
+The OpenAI-compatible backend also serves as the gateway for **Azure OpenAI**, **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — point the matching base URL env var at the service.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
+**Model-name prefix routing:** If a model name starts with `openai/`, `azure/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
 ### Tested models and aliases
 
@@ -321,7 +346,7 @@ These are the models registered in the built-in alias table with known token lim
 | `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
 | `grok-2` | `grok-2` | xAI | — | — |
 
-Any model name that does not match an alias is passed through verbatim. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
+Any model name that does not match an alias is passed through verbatim. This is how you use Azure deployment names (`my-gpt-4.1-prod`), OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
 
 ### User-defined aliases
 

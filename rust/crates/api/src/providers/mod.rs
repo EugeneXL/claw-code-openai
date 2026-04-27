@@ -193,6 +193,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    if canonical.starts_with("azure/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "AZURE_OPENAI_API_KEY",
+            base_url_env: "AZURE_OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_AZURE_OPENAI_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
@@ -233,6 +241,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     {
         return ProviderKind::OpenAi;
     }
+    if azure_openai_configured() {
+        return ProviderKind::OpenAi;
+    }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
     }
@@ -247,7 +258,17 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if std::env::var_os("OPENAI_BASE_URL").is_some() {
         return ProviderKind::OpenAi;
     }
+    if std::env::var_os("AZURE_OPENAI_BASE_URL").is_some() {
+        return ProviderKind::OpenAi;
+    }
     ProviderKind::Anthropic
+}
+
+#[must_use]
+pub fn azure_openai_configured() -> bool {
+    std::env::var_os("AZURE_OPENAI_BASE_URL").is_some()
+        && (openai_compat::has_api_key("AZURE_OPENAI_API_KEY")
+            || openai_compat::has_api_key("OPENAI_API_KEY"))
 }
 
 #[must_use]
@@ -458,7 +479,6 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     use serde_json::json;
 
@@ -479,10 +499,7 @@ mod tests {
     /// each other's partially-applied state while probing the foreign
     /// provider credential sniffer.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_env_lock()
     }
 
     /// Snapshot-restore guard for a single environment variable. Captures
@@ -553,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn azure_prefix_routes_to_azure_openai_metadata() {
+        let meta = super::metadata_for_model("azure/gpt-4.1")
+            .expect("azure/ prefix must resolve to Azure OpenAI metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "AZURE_OPENAI_API_KEY");
+        assert_eq!(meta.base_url_env, "AZURE_OPENAI_BASE_URL");
+    }
+
+    #[test]
     fn qwen_prefix_routes_to_dashscope_not_anthropic() {
         // User request from Discord #clawcode-get-help: web3g wants to use
         // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
@@ -608,6 +634,24 @@ mod tests {
     fn kimi_alias_resolves_to_kimi_k2_5() {
         assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
         assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
+    fn azure_base_url_routes_unknown_models_to_openai_provider() {
+        let _lock = env_lock();
+        let _azure_base_url = EnvVarGuard::set(
+            "AZURE_OPENAI_BASE_URL",
+            Some("https://example.openai.azure.com/openai/v1/"),
+        );
+        let _azure_api_key = EnvVarGuard::set("AZURE_OPENAI_API_KEY", Some("azure-test-key"));
+        let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+
+        let provider = detect_provider_kind("my-deployment-name");
+        assert_eq!(
+            provider,
+            ProviderKind::OpenAi,
+            "Azure base URL should route bare deployment names to the OpenAI-compatible provider"
+        );
     }
 
     #[test]
@@ -753,14 +797,14 @@ mod tests {
     #[test]
     fn returns_context_window_metadata_for_kimi_models() {
         // kimi-k2.5
-        let k25_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have token limit metadata");
+        let k25_limit =
+            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
         assert_eq!(k25_limit.max_output_tokens, 16_384);
         assert_eq!(k25_limit.context_window_tokens, 256_000);
 
         // kimi-k1.5
-        let k15_limit = model_token_limit("kimi-k1.5")
-            .expect("kimi-k1.5 should have token limit metadata");
+        let k15_limit =
+            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
         assert_eq!(k15_limit.max_output_tokens, 16_384);
         assert_eq!(k15_limit.context_window_tokens, 256_000);
     }
@@ -768,11 +812,13 @@ mod tests {
     #[test]
     fn kimi_alias_resolves_to_kimi_k25_token_limits() {
         // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
-        let alias_limit = model_token_limit("kimi")
-            .expect("kimi alias should resolve to kimi-k2.5 limits");
-        let direct_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have limits");
-        assert_eq!(alias_limit.max_output_tokens, direct_limit.max_output_tokens);
+        let alias_limit =
+            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
+        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
+        assert_eq!(
+            alias_limit.max_output_tokens,
+            direct_limit.max_output_tokens
+        );
         assert_eq!(
             alias_limit.context_window_tokens,
             direct_limit.context_window_tokens

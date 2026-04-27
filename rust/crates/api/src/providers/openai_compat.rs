@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -39,7 +40,8 @@ pub struct OpenAiCompatConfig {
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
-const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"];
+const AZURE_OPENAI_ENV_VARS: &[&str] = &["AZURE_OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 
 // Provider-specific request body size limits in bytes
@@ -70,6 +72,17 @@ impl OpenAiCompatConfig {
         }
     }
 
+    #[must_use]
+    pub const fn azure_openai() -> Self {
+        Self {
+            provider_name: "Azure OpenAI",
+            api_key_env: "AZURE_OPENAI_API_KEY",
+            base_url_env: "AZURE_OPENAI_BASE_URL",
+            default_base_url: DEFAULT_AZURE_OPENAI_BASE_URL,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
@@ -90,6 +103,7 @@ impl OpenAiCompatConfig {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "Azure OpenAI" => AZURE_OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
             _ => &[],
         }
@@ -130,7 +144,7 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        let Some(api_key) = read_api_key_from_env(config)? else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -270,10 +284,16 @@ impl OpenAiCompatClient {
         check_request_body_size(request, self.config())?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut request_builder = self
+            .http
             .post(&request_url)
-            .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
+            .header("content-type", "application/json");
+        request_builder = if is_azure_openai_base_url(&self.base_url) {
+            request_builder.header("api-key", &self.api_key)
+        } else {
+            request_builder.bearer_auth(&self.api_key)
+        };
+        request_builder
             .json(&build_chat_completion_request(request, self.config()))
             .send()
             .await
@@ -801,7 +821,10 @@ fn strip_routing_prefix(model: &str) -> &str {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        if matches!(
+            prefix,
+            "openai" | "azure" | "xai" | "grok" | "qwen" | "kimi"
+        ) {
             &model[pos + 1..]
         } else {
             model
@@ -1310,6 +1333,19 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     }
 }
 
+fn read_api_key_from_env(config: OpenAiCompatConfig) -> Result<Option<String>, ApiError> {
+    match config.provider_name {
+        // Allow Azure credentials to power the generic OpenAI-compatible route
+        // so users can point `AZURE_OPENAI_BASE_URL` at Azure and keep using
+        // standard `gpt-*` model names without extra flags.
+        "OpenAI" => read_env_non_empty("OPENAI_API_KEY").and_then(|value| match value {
+            Some(value) => Ok(Some(value)),
+            None => read_env_non_empty("AZURE_OPENAI_API_KEY"),
+        }),
+        _ => read_env_non_empty(config.api_key_env),
+    }
+}
+
 #[must_use]
 pub fn has_api_key(key: &str) -> bool {
     read_env_non_empty(key)
@@ -1320,16 +1356,49 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+    match config.provider_name {
+        "OpenAI" => read_env_non_empty("OPENAI_BASE_URL")
+            .ok()
+            .and_then(std::convert::identity)
+            .or_else(|| {
+                read_env_non_empty("AZURE_OPENAI_BASE_URL")
+                    .ok()
+                    .and_then(std::convert::identity)
+            })
+            .unwrap_or_else(|| config.default_base_url.to_string()),
+        "Azure OpenAI" => read_env_non_empty("AZURE_OPENAI_BASE_URL")
+            .ok()
+            .and_then(std::convert::identity)
+            .unwrap_or_else(|| config.default_base_url.to_string()),
+        _ => read_env_non_empty(config.base_url_env)
+            .ok()
+            .and_then(std::convert::identity)
+            .unwrap_or_else(|| config.default_base_url.to_string()),
+    }
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
+    let trimmed = base_url.trim();
+    let (path, query) = match trimmed.split_once('?') {
+        Some((path, query)) => (path.trim_end_matches('/'), Some(query)),
+        None => (trimmed.trim_end_matches('/'), None),
+    };
+    let endpoint = if path.ends_with("/chat/completions") {
+        path.to_string()
     } else {
-        format!("{trimmed}/chat/completions")
+        format!("{path}/chat/completions")
+    };
+    match query {
+        Some(query) if !query.is_empty() => format!("{endpoint}?{query}"),
+        _ => endpoint,
     }
+}
+
+fn is_azure_openai_base_url(base_url: &str) -> bool {
+    let lowered = base_url.to_ascii_lowercase();
+    lowered.contains(".openai.azure.com/")
+        || lowered.contains(".services.ai.azure.com/openai/")
+        || lowered.contains(".cognitiveservices.azure.com/openai/")
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1422,7 +1491,7 @@ mod tests {
         ToolResultContentBlock,
     };
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
+    use std::ffi::OsString;
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
@@ -1622,13 +1691,60 @@ mod tests {
             chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
             "https://api.x.ai/v1/chat/completions"
         );
+        assert_eq!(
+            chat_completions_endpoint(
+                "https://example.openai.azure.com/openai/deployments/my-deployment?api-version=2024-10-21"
+            ),
+            "https://example.openai.azure.com/openai/deployments/my-deployment/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn azure_openai_config_reads_api_key_and_base_url_from_azure_env_vars() {
+        let _lock = env_lock();
+        let _azure_api_key = EnvVarGuard::set("AZURE_OPENAI_API_KEY", Some("azure-test-key"));
+        let _azure_base_url = EnvVarGuard::set(
+            "AZURE_OPENAI_BASE_URL",
+            Some("https://example.openai.azure.com/openai/v1/"),
+        );
+        let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::azure_openai())
+            .expect("azure config should read AZURE_OPENAI_* env vars");
+        assert_eq!(
+            client.base_url(),
+            "https://example.openai.azure.com/openai/v1/"
+        );
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
+        crate::test_env_lock()
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]
@@ -2195,9 +2311,16 @@ mod tests {
 
     #[test]
     fn provider_specific_size_limits_are_correct() {
-        assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
-        assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
-        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
+        assert_eq!(
+            OpenAiCompatConfig::dashscope().max_request_body_bytes,
+            6_291_456
+        ); // 6MB
+        assert_eq!(
+            OpenAiCompatConfig::openai().max_request_body_bytes,
+            104_857_600
+        ); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
+        // 50MB
     }
 
     #[test]
@@ -2206,5 +2329,6 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+        assert_eq!(super::strip_routing_prefix("azure/gpt-4.1"), "gpt-4.1");
     }
 }

@@ -41,7 +41,11 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"];
-const AZURE_OPENAI_ENV_VARS: &[&str] = &["AZURE_OPENAI_API_KEY"];
+const AZURE_OPENAI_ENV_VARS: &[&str] = &[
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_BASE_URL",
+    "AZURE_OPENAI_ENDPOINT",
+];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 
 // Provider-specific request body size limits in bytes
@@ -283,7 +287,7 @@ impl OpenAiCompatClient {
         // Pre-flight check: verify request body size against provider limits
         check_request_body_size(request, self.config())?;
 
-        let request_url = chat_completions_endpoint(&self.base_url);
+        let request_url = chat_completions_endpoint(&self.base_url, &request.model, self.config);
         let mut request_builder = self
             .http
             .post(&request_url)
@@ -1366,10 +1370,7 @@ pub fn read_base_url(config: OpenAiCompatConfig) -> String {
                     .and_then(std::convert::identity)
             })
             .unwrap_or_else(|| config.default_base_url.to_string()),
-        "Azure OpenAI" => read_env_non_empty("AZURE_OPENAI_BASE_URL")
-            .ok()
-            .and_then(std::convert::identity)
-            .unwrap_or_else(|| config.default_base_url.to_string()),
+        "Azure OpenAI" => resolve_azure_openai_base_url(config.default_base_url),
         _ => read_env_non_empty(config.base_url_env)
             .ok()
             .and_then(std::convert::identity)
@@ -1377,7 +1378,10 @@ pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     }
 }
 
-fn chat_completions_endpoint(base_url: &str) -> String {
+fn chat_completions_endpoint(base_url: &str, model: &str, config: OpenAiCompatConfig) -> String {
+    if config.provider_name == "Azure OpenAI" || is_azure_openai_base_url(base_url) {
+        return azure_chat_completions_endpoint(base_url, model);
+    }
     let trimmed = base_url.trim();
     let (path, query) = match trimmed.split_once('?') {
         Some((path, query)) => (path.trim_end_matches('/'), Some(query)),
@@ -1394,11 +1398,83 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     }
 }
 
+fn azure_chat_completions_endpoint(base_url: &str, model: &str) -> String {
+    let trimmed = base_url.trim();
+    let (path, query) = match trimmed.split_once('?') {
+        Some((path, query)) => (path.trim_end_matches('/'), Some(query)),
+        None => (trimmed.trim_end_matches('/'), None),
+    };
+
+    if path.ends_with("/chat/completions") {
+        return match query {
+            Some(query) if !query.is_empty() => format!("{path}?{query}"),
+            _ => path.to_string(),
+        };
+    }
+
+    if path.contains("/openai/deployments/") {
+        let endpoint = format!("{path}/chat/completions");
+        return match query {
+            Some(query) if !query.is_empty() => format!("{endpoint}?{query}"),
+            _ => endpoint,
+        };
+    }
+
+    if path.ends_with("/openai/v1") || path.ends_with("/openai/v1/") {
+        return format!("{}/chat/completions", path.trim_end_matches('/'));
+    }
+
+    if path.contains(".openai.azure.com")
+        || path.contains(".services.ai.azure.com")
+        || path.contains(".cognitiveservices.azure.com")
+    {
+        let deployment = read_env_non_empty("AZURE_OPENAI_DEPLOYMENT")
+            .ok()
+            .and_then(std::convert::identity)
+            .unwrap_or_else(|| strip_routing_prefix(model).to_string());
+        let endpoint = format!(
+            "{}/openai/deployments/{deployment}/chat/completions",
+            path.trim_end_matches('/')
+        );
+        let api_version = query
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                read_env_non_empty("AZURE_OPENAI_API_VERSION")
+                    .ok()
+                    .and_then(std::convert::identity)
+            });
+        return match api_version {
+            Some(version) if version.starts_with("api-version=") => format!("{endpoint}?{version}"),
+            Some(version) if !version.is_empty() => format!("{endpoint}?api-version={version}"),
+            _ => format!("{}/openai/v1/chat/completions", path.trim_end_matches('/')),
+        };
+    }
+
+    format!("{}/chat/completions", path.trim_end_matches('/'))
+}
+
+fn resolve_azure_openai_base_url(default_base_url: &str) -> String {
+    if let Some(base_url) = read_env_non_empty("AZURE_OPENAI_BASE_URL")
+        .ok()
+        .and_then(std::convert::identity)
+    {
+        return base_url;
+    }
+    if let Some(endpoint) = read_env_non_empty("AZURE_OPENAI_ENDPOINT")
+        .ok()
+        .and_then(std::convert::identity)
+    {
+        return endpoint;
+    }
+    default_base_url.to_string()
+}
+
 fn is_azure_openai_base_url(base_url: &str) -> bool {
     let lowered = base_url.to_ascii_lowercase();
-    lowered.contains(".openai.azure.com/")
-        || lowered.contains(".services.ai.azure.com/openai/")
-        || lowered.contains(".cognitiveservices.azure.com/openai/")
+    lowered.contains(".openai.azure.com")
+        || lowered.contains(".services.ai.azure.com")
+        || lowered.contains(".cognitiveservices.azure.com")
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1680,20 +1756,26 @@ mod tests {
     #[test]
     fn endpoint_builder_accepts_base_urls_and_full_endpoints() {
         assert_eq!(
-            chat_completions_endpoint("https://api.x.ai/v1"),
+            chat_completions_endpoint("https://api.x.ai/v1", "grok-3", OpenAiCompatConfig::xai()),
             "https://api.x.ai/v1/chat/completions"
         );
         assert_eq!(
-            chat_completions_endpoint("https://api.x.ai/v1/"),
-            "https://api.x.ai/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_endpoint("https://api.x.ai/v1/chat/completions"),
+            chat_completions_endpoint("https://api.x.ai/v1/", "grok-3", OpenAiCompatConfig::xai()),
             "https://api.x.ai/v1/chat/completions"
         );
         assert_eq!(
             chat_completions_endpoint(
-                "https://example.openai.azure.com/openai/deployments/my-deployment?api-version=2024-10-21"
+                "https://api.x.ai/v1/chat/completions",
+                "grok-3",
+                OpenAiCompatConfig::xai()
+            ),
+            "https://api.x.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_endpoint(
+                "https://example.openai.azure.com/openai/deployments/my-deployment?api-version=2024-10-21",
+                "gpt-4.1",
+                OpenAiCompatConfig::azure_openai()
             ),
             "https://example.openai.azure.com/openai/deployments/my-deployment/chat/completions?api-version=2024-10-21"
         );
@@ -1716,6 +1798,41 @@ mod tests {
             client.base_url(),
             "https://example.openai.azure.com/openai/v1/"
         );
+    }
+
+    #[test]
+    fn azure_openai_endpoint_config_builds_deployment_url_from_endpoint_style_settings() {
+        let _lock = env_lock();
+        let _azure_api_key = EnvVarGuard::set("AZURE_OPENAI_API_KEY", Some("azure-test-key"));
+        let _azure_base_url = EnvVarGuard::set("AZURE_OPENAI_BASE_URL", None);
+        let _azure_endpoint = EnvVarGuard::set(
+            "AZURE_OPENAI_ENDPOINT",
+            Some("https://example.openai.azure.com"),
+        );
+        let _azure_deployment = EnvVarGuard::set("AZURE_OPENAI_DEPLOYMENT", Some("gpt-4o-prod"));
+        let _azure_api_version = EnvVarGuard::set("AZURE_OPENAI_API_VERSION", Some("2024-10-21"));
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::azure_openai())
+            .expect("azure config should read endpoint-style env vars");
+        assert_eq!(client.base_url(), "https://example.openai.azure.com");
+        assert_eq!(
+            chat_completions_endpoint(
+                client.base_url(),
+                "gpt-4.1",
+                OpenAiCompatConfig::azure_openai()
+            ),
+            "https://example.openai.azure.com/openai/deployments/gpt-4o-prod/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn azure_host_without_openai_path_is_still_detected_as_azure() {
+        assert!(super::is_azure_openai_base_url(
+            "https://example.openai.azure.com"
+        ));
+        assert!(super::is_azure_openai_base_url(
+            "https://project.services.ai.azure.com"
+        ));
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

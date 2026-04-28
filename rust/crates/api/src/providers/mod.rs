@@ -266,7 +266,8 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn azure_openai_configured() -> bool {
-    std::env::var_os("AZURE_OPENAI_BASE_URL").is_some()
+    (std::env::var_os("AZURE_OPENAI_BASE_URL").is_some()
+        || std::env::var_os("AZURE_OPENAI_ENDPOINT").is_some())
         && (openai_compat::has_api_key("AZURE_OPENAI_API_KEY")
             || openai_compat::has_api_key("OPENAI_API_KEY"))
 }
@@ -651,6 +652,25 @@ mod tests {
             provider,
             ProviderKind::OpenAi,
             "Azure base URL should route bare deployment names to the OpenAI-compatible provider"
+        );
+    }
+
+    #[test]
+    fn azure_endpoint_routes_unknown_models_to_openai_provider() {
+        let _lock = env_lock();
+        let _azure_base_url = EnvVarGuard::set("AZURE_OPENAI_BASE_URL", None);
+        let _azure_endpoint = EnvVarGuard::set(
+            "AZURE_OPENAI_ENDPOINT",
+            Some("https://example.openai.azure.com"),
+        );
+        let _azure_api_key = EnvVarGuard::set("AZURE_OPENAI_API_KEY", Some("azure-test-key"));
+        let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+
+        let provider = detect_provider_kind("my-deployment-name");
+        assert_eq!(
+            provider,
+            ProviderKind::OpenAi,
+            "Azure endpoint should route bare deployment names to the OpenAI-compatible provider"
         );
     }
 

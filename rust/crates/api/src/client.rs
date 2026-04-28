@@ -262,4 +262,30 @@ mod tests {
             other => panic!("Expected ProviderClient::OpenAi for Azure gpt model, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn azure_endpoint_style_env_is_accepted_for_gpt_models() {
+        let _lock = env_lock();
+        let _azure_base_url = EnvVarGuard::set("AZURE_OPENAI_BASE_URL", None);
+        let _azure_endpoint = EnvVarGuard::set(
+            "AZURE_OPENAI_ENDPOINT",
+            Some("https://example.openai.azure.com"),
+        );
+        let _azure_api_key = EnvVarGuard::set("AZURE_OPENAI_API_KEY", Some("azure-test-key"));
+        let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+
+        let client = ProviderClient::from_model("gpt-4.1");
+        assert!(
+            client.is_ok(),
+            "gpt-4.1 with Azure endpoint env configured should build successfully, got: {:?}",
+            client.err()
+        );
+
+        match client.unwrap() {
+            ProviderClient::OpenAi(openai_client) => {
+                assert_eq!(openai_client.base_url(), "https://example.openai.azure.com");
+            }
+            other => panic!("Expected ProviderClient::OpenAi for Azure gpt model, got: {other:?}"),
+        }
+    }
 }

@@ -292,7 +292,7 @@ impl OpenAiCompatClient {
             .http
             .post(&request_url)
             .header("content-type", "application/json");
-        request_builder = if is_azure_openai_base_url(&self.base_url) {
+        request_builder = if uses_azure_openai_api_key_auth(self.config, &self.base_url) {
             request_builder.header("api-key", &self.api_key)
         } else {
             request_builder.bearer_auth(&self.api_key)
@@ -1404,6 +1404,18 @@ fn azure_chat_completions_endpoint(base_url: &str, model: &str) -> String {
         Some((path, query)) => (path.trim_end_matches('/'), Some(query)),
         None => (trimmed.trim_end_matches('/'), None),
     };
+    let configured_deployment = read_env_non_empty("AZURE_OPENAI_DEPLOYMENT")
+        .ok()
+        .and_then(std::convert::identity)
+        .unwrap_or_else(|| strip_routing_prefix(model).to_string());
+    let configured_api_version = query
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            read_env_non_empty("AZURE_OPENAI_API_VERSION")
+                .ok()
+                .and_then(std::convert::identity)
+        });
 
     if path.ends_with("/chat/completions") {
         return match query {
@@ -1427,24 +1439,15 @@ fn azure_chat_completions_endpoint(base_url: &str, model: &str) -> String {
     if path.contains(".openai.azure.com")
         || path.contains(".services.ai.azure.com")
         || path.contains(".cognitiveservices.azure.com")
+        || std::env::var_os("AZURE_OPENAI_DEPLOYMENT").is_some()
+        || std::env::var_os("AZURE_OPENAI_API_VERSION").is_some()
     {
-        let deployment = read_env_non_empty("AZURE_OPENAI_DEPLOYMENT")
-            .ok()
-            .and_then(std::convert::identity)
-            .unwrap_or_else(|| strip_routing_prefix(model).to_string());
         let endpoint = format!(
-            "{}/openai/deployments/{deployment}/chat/completions",
-            path.trim_end_matches('/')
+            "{}/openai/deployments/{}/chat/completions",
+            path.trim_end_matches('/'),
+            configured_deployment
         );
-        let api_version = query
-            .map(str::to_owned)
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                read_env_non_empty("AZURE_OPENAI_API_VERSION")
-                    .ok()
-                    .and_then(std::convert::identity)
-            });
-        return match api_version {
+        return match configured_api_version {
             Some(version) if version.starts_with("api-version=") => format!("{endpoint}?{version}"),
             Some(version) if !version.is_empty() => format!("{endpoint}?api-version={version}"),
             _ => format!("{}/openai/v1/chat/completions", path.trim_end_matches('/')),
@@ -1475,6 +1478,10 @@ fn is_azure_openai_base_url(base_url: &str) -> bool {
     lowered.contains(".openai.azure.com")
         || lowered.contains(".services.ai.azure.com")
         || lowered.contains(".cognitiveservices.azure.com")
+}
+
+fn uses_azure_openai_api_key_auth(config: OpenAiCompatConfig, base_url: &str) -> bool {
+    config.provider_name == "Azure OpenAI" || is_azure_openai_base_url(base_url)
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1826,12 +1833,53 @@ mod tests {
     }
 
     #[test]
+    fn azure_gateway_endpoint_config_builds_deployment_url_for_non_azure_domain() {
+        let _lock = env_lock();
+        let _azure_api_key = EnvVarGuard::set("AZURE_OPENAI_API_KEY", Some("azure-test-key"));
+        let _azure_base_url = EnvVarGuard::set("AZURE_OPENAI_BASE_URL", None);
+        let _azure_endpoint = EnvVarGuard::set(
+            "AZURE_OPENAI_ENDPOINT",
+            Some("https://apimgateway.siemens-healthineers.com"),
+        );
+        let _azure_deployment = EnvVarGuard::set("AZURE_OPENAI_DEPLOYMENT", Some("gpt-5.2"));
+        let _azure_api_version =
+            EnvVarGuard::set("AZURE_OPENAI_API_VERSION", Some("2024-12-01-preview"));
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::azure_openai())
+            .expect("gateway-style Azure config should read endpoint-style env vars");
+        assert_eq!(
+            client.base_url(),
+            "https://apimgateway.siemens-healthineers.com"
+        );
+        assert_eq!(
+            chat_completions_endpoint(
+                client.base_url(),
+                "gpt-5.2",
+                OpenAiCompatConfig::azure_openai()
+            ),
+            "https://apimgateway.siemens-healthineers.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview"
+        );
+    }
+
+    #[test]
     fn azure_host_without_openai_path_is_still_detected_as_azure() {
         assert!(super::is_azure_openai_base_url(
             "https://example.openai.azure.com"
         ));
         assert!(super::is_azure_openai_base_url(
             "https://project.services.ai.azure.com"
+        ));
+    }
+
+    #[test]
+    fn azure_config_uses_api_key_auth_even_for_custom_gateway_domains() {
+        assert!(super::uses_azure_openai_api_key_auth(
+            OpenAiCompatConfig::azure_openai(),
+            "https://apimgateway.siemens-healthineers.com/openai/deployments/gpt-5.2/chat/completions?api-version=2024-12-01-preview"
+        ));
+        assert!(!super::uses_azure_openai_api_key_auth(
+            OpenAiCompatConfig::openai(),
+            "https://gateway.example.com/v1"
         ));
     }
 

@@ -40,6 +40,37 @@ Or provide an OAuth bearer token directly:
 export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 ```
 
+Azure OpenAI is also supported. Either provide a full deployment URL:
+
+```bash
+export AZURE_OPENAI_BASE_URL="https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT?api-version=2024-10-21"
+export AZURE_OPENAI_API_KEY="your-azure-key"
+cargo run -p rusty-claude-cli -- --model YOUR-DEPLOYMENT prompt "hello"
+```
+
+Or use endpoint-style settings:
+
+```bash
+export AZURE_OPENAI_ENDPOINT="https://YOUR-RESOURCE.openai.azure.com"
+export AZURE_OPENAI_DEPLOYMENT="YOUR-DEPLOYMENT"
+export AZURE_OPENAI_API_VERSION="2024-10-21"
+export AZURE_OPENAI_API_KEY="your-azure-key"
+cargo run -p rusty-claude-cli -- --model YOUR-DEPLOYMENT prompt "hello"
+```
+
+For long-running sessions, input-token auto-compaction can be configured in `.claw.json` / `settings.json`:
+
+```json
+{
+  "plugins": {
+    "maxInputTokens": 240000,
+    "maxOutputTokens": 8192
+  }
+}
+```
+
+`maxInputTokens` triggers pre-request compaction of older history; `maxOutputTokens` controls the requested completion size. The full provider and config guide lives in [`../USAGE.md`](../USAGE.md).
+
 ## Mock parity harness
 
 The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.

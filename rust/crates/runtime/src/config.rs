@@ -48,6 +48,7 @@ pub struct RuntimePluginConfig {
     install_root: Option<String>,
     registry_path: Option<String>,
     bundled_root: Option<String>,
+    max_input_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
 }
 
@@ -534,6 +535,15 @@ impl RuntimePluginConfig {
     }
 
     #[must_use]
+    pub fn max_input_tokens(&self) -> Option<u32> {
+        self.max_input_tokens
+    }
+
+    pub fn set_max_input_tokens(&mut self, max_input_tokens: Option<u32>) {
+        self.max_input_tokens = max_input_tokens;
+    }
+
+    #[must_use]
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.max_output_tokens
     }
@@ -824,6 +834,7 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
         optional_string(plugins, "registryPath", "merged settings.plugins")?.map(str::to_string);
     config.bundled_root =
         optional_string(plugins, "bundledRoot", "merged settings.plugins")?.map(str::to_string);
+    config.max_input_tokens = optional_u32(plugins, "maxInputTokens", "merged settings.plugins")?;
     config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?;
     Ok(config)
 }
@@ -1705,6 +1716,7 @@ mod tests {
                 "core-helpers@builtin": true
               },
               "plugins": {
+                "maxInputTokens": 54321,
                 "externalDirectories": ["./external-plugins"],
                 "installRoot": "plugin-cache/installed",
                 "registryPath": "plugin-cache/installed.json",
@@ -1738,6 +1750,7 @@ mod tests {
             Some("plugin-cache/installed.json")
         );
         assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
+        assert_eq!(loaded.plugins().max_input_tokens(), Some(54321));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

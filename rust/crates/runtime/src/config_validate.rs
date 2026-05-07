@@ -255,6 +255,10 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "maxInputTokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "maxOutputTokens",
         expected: FieldType::Number,
     },

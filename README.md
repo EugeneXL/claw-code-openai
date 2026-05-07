@@ -178,6 +178,49 @@ claw --help
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
+### Azure OpenAI quick setup
+
+`claw` supports Azure OpenAI through the OpenAI-compatible backend. The two common setups are:
+
+**1. Prebuilt deployment URL**
+
+```bash
+export AZURE_OPENAI_BASE_URL="https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT?api-version=2024-10-21"
+export AZURE_OPENAI_API_KEY="your-azure-key"
+
+cd rust
+./target/debug/claw --model "YOUR-DEPLOYMENT" prompt "say hello"
+```
+
+**2. Endpoint + deployment + api-version**
+
+```bash
+export AZURE_OPENAI_ENDPOINT="https://YOUR-RESOURCE.openai.azure.com"
+export AZURE_OPENAI_DEPLOYMENT="YOUR-DEPLOYMENT"
+export AZURE_OPENAI_API_VERSION="2024-10-21"
+export AZURE_OPENAI_API_KEY="your-azure-key"
+
+cd rust
+./target/debug/claw --model "YOUR-DEPLOYMENT" prompt "say hello"
+```
+
+For Azure, the safest rule is: pass the **deployment name** as `--model`. If your organization fronts Azure behind an API gateway, the same `endpoint + deployment + api-version + api-key` flow is supported.
+
+### Input-token auto compact
+
+Long-running sessions can now auto-compact before the next request is sent. Configure both input and output token behavior in `.claw.json` or `settings.json`:
+
+```json
+{
+  "plugins": {
+    "maxInputTokens": 240000,
+    "maxOutputTokens": 8192
+  }
+}
+```
+
+`maxInputTokens` is the estimated input-token threshold that triggers automatic compaction of older conversation history. `maxOutputTokens` is still the requested completion size. If compaction cannot remove any older context, `claw` fails early with a clear error instead of waiting for the provider to reject the request.
+
 Run the workspace test suite after verifying the binary works:
 
 ```bash

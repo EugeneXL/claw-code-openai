@@ -360,6 +360,25 @@ These are the models registered in the built-in alias table with known token lim
 
 Any model name that does not match an alias is passed through verbatim. This is how you use Azure deployment names (`my-gpt-4.1-prod`), OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
 
+### Input-token auto compact
+
+`claw` also supports a configurable input-token threshold for long-running sessions. When the estimated session input tokens reach the configured limit, `claw` now auto-runs compaction before sending the next model request.
+
+Configure it in any settings file:
+
+```json
+{
+  "plugins": {
+    "maxInputTokens": 240000,
+    "maxOutputTokens": 8192
+  }
+}
+```
+
+`maxInputTokens` controls when pre-request auto-compaction triggers. `maxOutputTokens` still controls the requested completion size.
+
+If compaction cannot remove any older history, the request fails early with a clear error telling you to start a fresh session or compact manually.
+
 ### User-defined aliases
 
 You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw/settings.json`, or `.claw/settings.local.json`):

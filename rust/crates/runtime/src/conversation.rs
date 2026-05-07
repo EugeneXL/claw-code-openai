@@ -181,7 +181,10 @@ where
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
-            auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            auto_compaction_input_tokens_threshold: feature_config
+                .plugins()
+                .max_input_tokens()
+                .unwrap_or_else(auto_compaction_threshold_from_env),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -338,6 +341,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut auto_compaction_removed_message_count = 0usize;
 
         loop {
             iterations += 1;
@@ -347,6 +351,11 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            if let Some(event) = self.maybe_auto_compact_before_request()? {
+                auto_compaction_removed_message_count = auto_compaction_removed_message_count
+                    .saturating_add(event.removed_message_count);
             }
 
             let request = ApiRequest {
@@ -499,7 +508,14 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        if let Some(event) = self.maybe_auto_compact_before_request()? {
+            auto_compaction_removed_message_count =
+                auto_compaction_removed_message_count.saturating_add(event.removed_message_count);
+        }
+        let auto_compaction =
+            (auto_compaction_removed_message_count > 0).then_some(AutoCompactionEvent {
+                removed_message_count: auto_compaction_removed_message_count,
+            });
 
         let summary = TurnSummary {
             assistant_messages,
@@ -552,13 +568,14 @@ where
         self.session
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
-            return None;
+    fn maybe_auto_compact_before_request(
+        &mut self,
+    ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
+        let estimated_input_tokens =
+            u32::try_from(estimate_session_tokens(&self.session)).unwrap_or(u32::MAX);
+        if estimated_input_tokens < self.auto_compaction_input_tokens_threshold {
+            return Ok(None);
         }
-
         let result = compact_session(
             &self.session,
             CompactionConfig {
@@ -568,13 +585,16 @@ where
         );
 
         if result.removed_message_count == 0 {
-            return None;
+            return Err(RuntimeError::new(format!(
+                "estimated input tokens ({estimated_input_tokens}) exceed the configured limit of {} and auto-compaction could not remove any older messages; start a fresh session or compact manually",
+                self.auto_compaction_input_tokens_threshold
+            )));
         }
 
         self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
+        Ok(Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
-        })
+        }))
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -1503,21 +1523,75 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_before_request_when_estimated_input_threshold_is_crossed() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(
+                    request.messages[0].role,
+                    MessageRole::System,
+                    "session should be compacted before the API request is sent"
+                );
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 120_000,
-                        output_tokens: 4,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one ".repeat(80).trim().to_string()),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two ".repeat(80).trim().to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three ".repeat(80).trim().to_string()),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four ".repeat(80).trim().to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("five ".repeat(80).trim().to_string()),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "six ".repeat(80).trim().to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("seven ".repeat(80).trim().to_string()),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "eight ".repeat(80).trim().to_string(),
+            }]),
+        ];
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 6,
+            })
+        );
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn skips_auto_compaction_below_estimated_input_threshold() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(
+                    request.messages[0].role,
+                    MessageRole::User,
+                    "session should be sent verbatim when still below the threshold"
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
                 ])
             }
@@ -1529,9 +1603,41 @@ mod tests {
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "two".to_string(),
             }]),
-            crate::session::ConversationMessage::user_text("three"),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn errors_when_auto_compaction_cannot_remove_any_older_messages() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("API request should not be sent when compaction cannot reduce the session");
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("x".repeat(20_000)),
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "four".to_string(),
+                text: "recent".to_string(),
             }]),
         ];
 
@@ -1542,56 +1648,17 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(100_000);
+        .with_auto_compaction_input_tokens_threshold(100);
 
-        let summary = runtime
+        let error = runtime
             .run_turn("trigger", None)
-            .expect("turn should succeed");
-
-        assert_eq!(
-            summary.auto_compaction,
-            Some(AutoCompactionEvent {
-                removed_message_count: 2,
-            })
+            .expect_err("should fail when auto-compaction cannot remove any older messages");
+        assert!(
+            error
+                .to_string()
+                .contains("auto-compaction could not remove any older messages"),
+            "error should explain that older messages were unavailable for compaction: {error}"
         );
-        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
-    }
-
-    #[test]
-    fn skips_auto_compaction_below_threshold() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 99_999,
-                        output_tokens: 4,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    }),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            SimpleApi,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()],
-        )
-        .with_auto_compaction_input_tokens_threshold(100_000);
-
-        let summary = runtime
-            .run_turn("trigger", None)
-            .expect("turn should succeed");
-        assert_eq!(summary.auto_compaction, None);
-        assert_eq!(runtime.session().messages.len(), 2);
     }
 
     #[test]
